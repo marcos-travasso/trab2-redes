@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/md5"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -63,20 +65,20 @@ func handleClient(clientAddr *unix.SockaddrInet4, n int, buffer []byte) {
 	client := getClientName(clientAddr)
 	log.Printf("%s > %s\n", client, string(buffer[:n]))
 
-	responses, err := handleCommand(string(buffer[:n]))
+	blocks, err := handleCommand(string(buffer[:n]))
 	if err != nil {
 		log.Printf("Error handling client %s: %v\n", client, err)
 		return
 	}
-	log.Printf("DEBUG sending %d blocks to %s\n", len(responses), client)
 
-	for _, response := range responses {
-		log.Printf("sending: %x (len %d)\n", response, len(response))
-		err = unix.Sendto(serverFd, response, 0, &unix.SockaddrInet4{Port: clientAddr.Port})
+	for _, block := range blocks {
+		//log.Printf("DEBUG %d\tlen %d\tmd5: %s\n", i, len(block), calculateMD5(block))
+		err = unix.Sendto(serverFd, block, 0, &unix.SockaddrInet4{Port: clientAddr.Port})
 		if err != nil {
 			log.Printf("Error writing to %s: %v\n", client, err)
 			return
 		}
+		time.Sleep(1000) // todo ve se prec
 	}
 }
 
@@ -127,7 +129,7 @@ func createMetadataByteArray(file *os.File) ([]byte, error) {
 	fileSize := uint32(fileInfo.Size())
 
 	// Get MD5 hash of the file content
-	md5Sum, err := calculateMD5(file)
+	md5Sum, err := calculateFileMD5(file)
 	if err != nil {
 		return nil, err
 	}
@@ -158,34 +160,40 @@ func createDataByteArray(file *os.File, size int64) ([]byte, error) {
 
 func joinBytes(metadata, data []byte) [][]byte {
 	dataSize := len(data)
-	totalDataBlocks := int(math.Ceil(float64(dataSize)/2046)) + 1
+	totalDataBlocks := int(math.Ceil(float64(dataSize)/float64(BUFFER_SIZE-2))) + 1
 	blocks := make([][]byte, totalDataBlocks)
-	log.Printf("size: %d, totaldata %d, blocks %d\n", dataSize, totalDataBlocks, blocks)
+	//log.Printf("DATA %s\n", string(data))
 
 	blocks[0] = metadata
-	log.Printf("METADATA %x\n", blocks[0])
 	i := 1
 	for dataSize >= BUFFER_SIZE-2 {
-		log.Printf("writing inside loop")
+		//log.Printf("data %d buf %d\n", dataSize, BUFFER_SIZE-2)
 		blocks[i] = make([]byte, BUFFER_SIZE)
-		binary.BigEndian.PutUint32(blocks[i][:2], uint32(i))
-		copy(blocks[i][2:], data[(i-1)*(BUFFER_SIZE-2):(i-1)*(BUFFER_SIZE-2)+BUFFER_SIZE-2])
+		binary.BigEndian.PutUint32(blocks[i][:4], uint32(i))
+		copy(blocks[i][4:], data[(i-1)*(BUFFER_SIZE-4):(i-1)*(BUFFER_SIZE-2)+BUFFER_SIZE-4])
+		//log.Printf("LENS %d e %d\n", len(blocks[i][4:]), len(data[(i-1)*(BUFFER_SIZE-2):(i-1)*(BUFFER_SIZE-2)+BUFFER_SIZE-2]))
+		//log.Printf("Segmento %d\t %d-%d \t %s\n", i, (i-1)*(BUFFER_SIZE-2), (i-1)*(BUFFER_SIZE-2)+BUFFER_SIZE-2, string(blocks[i][4:]))
+		//log.Printf("removendo: %d dev: %d\n", BUFFER_SIZE-2, len(blocks[i][4:]))
+		dataSize -= len(blocks[i][4:])
 		i++
-		dataSize -= BUFFER_SIZE - 2
 	}
 
 	if dataSize > 0 {
-		log.Printf("writing in if %d with i %d\n", dataSize, i)
 		blocks[i] = make([]byte, dataSize+4)
-		log.Printf("create datasize (%d ou %d) %d\n", i, uint32(i), dataSize+4)
 		binary.BigEndian.PutUint32(blocks[i][:4], uint32(i))
-		copy(blocks[i][4:], data[(i-1)*(BUFFER_SIZE-2):])
+		copy(blocks[i][4:], data[(i-1)*(BUFFER_SIZE-4):])
+		//log.Printf("Resto \t %d-%d \t %s\n", (i-1)*(BUFFER_SIZE-2), (i-1)*(BUFFER_SIZE-2)+dataSize, string(blocks[i][4:]))
 	}
 
 	return blocks
 }
 
-func calculateMD5(file *os.File) ([]byte, error) {
+func calculateMD5(data []byte) string {
+	hash := md5.Sum(data)
+	return hex.EncodeToString(hash[:])
+}
+
+func calculateFileMD5(file *os.File) ([]byte, error) {
 	hasher := md5.New()
 	if _, err := io.Copy(hasher, file); err != nil {
 		return nil, err
