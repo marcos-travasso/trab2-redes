@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"golang.org/x/sys/unix"
+	"io"
 	"log"
 	"math"
 	"net"
@@ -71,6 +72,27 @@ func main() {
 	}
 
 	buildFile(metadata, receivedBlocks)
+
+	if !verifyMD5(metadata) {
+		log.Fatal("Received file may be corrupted")
+	}
+
+	log.Printf("File transfered successfully!")
+}
+
+func verifyMD5(metadata Metadata) bool {
+	f, err := os.Open(metadata.FileName)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+
+	fileMD5, err := calculateFileMD5(f)
+	if err != nil {
+		return false
+	}
+
+	return hex.EncodeToString(fileMD5) == hex.EncodeToString(metadata.MD5Hash)
 }
 
 func buildFile(metadata Metadata, blocks map[uint32][]byte) {
@@ -145,7 +167,11 @@ func getEOF(data []byte) int {
 	return len(data)
 }
 
-func calculateMD5(data []byte) string {
-	hash := md5.Sum(data)
-	return hex.EncodeToString(hash[:])
+func calculateFileMD5(file *os.File) ([]byte, error) {
+	hasher := md5.New()
+	if _, err := io.Copy(hasher, file); err != nil {
+		return nil, err
+	}
+	log.Printf("DEBUG MD5: %x\n", hasher.Sum(nil))
+	return hasher.Sum(nil), nil
 }
