@@ -1,10 +1,10 @@
 package main
 
 import (
-	"fmt"
-	"golang.org/x/sys/unix"
 	"log"
 	"net"
+
+	"golang.org/x/sys/unix"
 )
 
 func main() {
@@ -32,19 +32,23 @@ func main() {
 	// Handle incoming data
 	buffer := make([]byte, 1024)
 	for {
-		n, from, err := unix.Recvfrom(serverFd, buffer, 0)
+		n, addr, err := unix.Recvfrom(serverFd, buffer, 0)
 		if err != nil {
 			log.Println("Error reading from UDP socket:", err)
 			continue
 		}
-		fmt.Printf("From: %+v\n", from)
-		log.Printf("Received %d bytes: %s\n", n, string(buffer[:n]))
 
-		//// Respond to the client
-		//message := []byte("Hello, client!")
-		//err = unix.Sendto(serverFd, message, 0, socketAddress)
-		//if err != nil {
-		//	log.Println("Error writing to UDP socket:", err)
-		//}
+		clientAddr := addr.(*unix.SockaddrInet4)
+
+		log.Printf("Received %d bytes from %+v: %s\n", n, clientAddr, string(buffer[:n]))
+
+		// Respond to the client
+		response := []byte("Hello, client!")
+		err = unix.Sendto(serverFd, response, 0, &unix.SockaddrInet4{
+			Port: clientAddr.Port,
+		})
+		if err != nil {
+			log.Println("Error writing to UDP socket:", err)
+		}
 	}
 }
