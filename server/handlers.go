@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/binary"
 	"os"
 	"strconv"
 )
@@ -23,7 +24,14 @@ func handleGet(parts []string) ([][]byte, error) {
 		return nil, err
 	}
 
-	return joinBytes(metadata, data), nil
+	result, err := joinBytes(metadata, data), nil
+	if err != nil {
+		return nil, err
+	}
+
+	binary.BigEndian.PutUint32(result[0][24:28], uint32(len(result)))
+
+	return result, nil
 }
 
 func handleRecover(parts []string) ([][]byte, error) {

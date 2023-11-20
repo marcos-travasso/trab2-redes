@@ -2,12 +2,11 @@ package main
 
 import (
 	"errors"
+	"golang.org/x/sys/unix"
 	"log"
 	"net"
 	"strings"
 	"time"
-
-	"golang.org/x/sys/unix"
 )
 
 var PORT = 8080
@@ -65,7 +64,7 @@ func handleClient(clientAddr *unix.SockaddrInet4, n int, buffer []byte) {
 	}
 
 	for _, block := range blocks {
-		//log.Printf("DEBUG %d\tlen %d\tmd5: %s\n", i, len(block), calculateMD5(block))
+		//log.Printf("DEBUG %d\tlen %d\tmd5: %s\t cont: %x\n", i, len(block), calculateMD5(block), block)
 		err = unix.Sendto(serverFd, block, 0, &unix.SockaddrInet4{Port: clientAddr.Port})
 		if err != nil {
 			log.Printf("Error writing to %s: %v\n", client, err)

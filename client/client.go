@@ -9,9 +9,9 @@ import (
 	"golang.org/x/sys/unix"
 	"io"
 	"log"
-	"math"
 	"net"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -30,13 +30,28 @@ const BUFFER_SIZE = 2048
 const IP = "127.0.0.1"
 const PORT = 8080
 
-var files map[string]TransferingFile
+var files map[string]*TransferingFile
 var clientFd int
-var serverAddr *unix.SockaddrInet4
+var serverAddr unix.SockaddrInet4
 
 func main() {
-	setupConnection()
-	files = make(map[string]TransferingFile)
+	//setupConnection()
+	var err error
+	clientFd, err = unix.Socket(unix.AF_INET, unix.SOCK_DGRAM, 0)
+	if err != nil {
+		log.Fatal("Error creating UDP socket:", err)
+	}
+	defer unix.Close(clientFd)
+
+	log.Printf("UDP Socket [%v] created\n", clientFd)
+
+	serverAddr = unix.SockaddrInet4{
+		Port: PORT,
+		Addr: [4]byte{127, 0, 0, 1},
+	}
+	copy(serverAddr.Addr[:], net.ParseIP(IP).To4())
+
+	files = make(map[string]*TransferingFile)
 
 	message := ""
 	fmt.Println("-------- UDP SERVER --------")
@@ -50,17 +65,14 @@ func main() {
 
 	reader := bufio.NewReader(os.Stdin)
 	for string(message) != "QUIT" {
-		// Message to send
-		//message := []byte("GET hello2.txt")
-		//message := []byte("GET banana.gif")
-		//message = []byte("RECOVER banana.gif 1 2 3 4")
+		fmt.Printf("> ")
 		message, _ = reader.ReadString('\n')
 		message = strings.ReplaceAll(message, "\n", "")
 
 		parts := strings.Split(message, " ")
 		switch parts[0] {
 		case "GET", "RECOVER":
-			sendMessage([]byte(message))
+			sendMessage(message)
 		case "BUILD":
 			buildFile(parts)
 		case "SHOW":
@@ -71,45 +83,42 @@ func main() {
 	}
 }
 
-func sendMessage(message []byte) {
-	err := unix.Sendto(clientFd, message, 0, serverAddr)
+func sendMessage(message string) {
+	err := unix.Sendto(clientFd, []byte(message), 0, &serverAddr)
 	if err != nil {
 		log.Fatal("Error sending message to server:", err)
 	}
 
-	parts := strings.Split(string(message), " ")
+	parts := strings.Split(message, " ")
 	transferingFile, exists := files[parts[1]]
 	if !exists && parts[0] == "RECOVER" {
 		log.Println("Error: no file to recover")
-	}
-
-	if !exists {
-		transferingFile = TransferingFile{ExpectedBlocks: 65535, ReceivedBlocks: make(map[uint32][]byte), Built: false}
-		files[parts[0]] = transferingFile
-	}
-
-	if parts[0] == "GET" {
-		handleReceivedBlocks(&transferingFile)
 		return
 	}
 
-	if parts[0] == "RECOVER" {
+	if !exists {
+		transferingFile = &TransferingFile{FileName: parts[1], ExpectedBlocks: 65535, ReceivedBlocks: make(map[uint32][]byte), Built: false}
+		files[parts[1]] = transferingFile
+	}
+
+	if parts[0] == "GET" {
+		handleReceivedBlocks(transferingFile)
+		return
+	}
+
+	if parts[0] == "RECOVER" { //todo entender pq o recover n ta funcionando
 		transferingFile.ExpectedBlocks = len(parts) - 2
-		handleReceivedBlocks(&transferingFile)
+		handleReceivedBlocks(transferingFile)
 		return
 	}
 }
 
 func handleReceivedBlocks(transferingFile *TransferingFile) {
-	for len(transferingFile.ReceivedBlocks) != transferingFile.TotalBlocks {
+	for len(transferingFile.ReceivedBlocks) != transferingFile.ExpectedBlocks {
 		buffer := make([]byte, BUFFER_SIZE)
 		n, _, err := unix.Recvfrom(clientFd, buffer, 0)
 		if err != nil {
 			log.Fatal("Error receiving response from server:", err)
-		}
-
-		if n < 4 {
-			continue
 		}
 
 		if binary.BigEndian.Uint32(buffer[:4]) == 0 {
@@ -118,11 +127,6 @@ func handleReceivedBlocks(transferingFile *TransferingFile) {
 		}
 
 		handleBlock(buffer[:n], transferingFile)
-	}
-
-	if !verifyMD5(transferingFile) {
-		log.Printf("Received file may be corrupted")
-		return
 	}
 
 	log.Printf("File transfered successfully!")
@@ -160,6 +164,7 @@ func buildFile(parts []string) {
 		block, exists := transferingFile.ReceivedBlocks[uint32(i)]
 		if !exists {
 			log.Printf("Error: block %d not found\n", i)
+			continue
 		}
 
 		_, err := f.Write(block[4:])
@@ -170,6 +175,13 @@ func buildFile(parts []string) {
 	}
 
 	transferingFile.Built = true
+
+	if !verifyMD5(transferingFile) {
+		log.Printf("Received file may be corrupted")
+		return
+	}
+
+	log.Println("File built successfully!")
 }
 
 func discardBlocks(parts []string) {
@@ -196,29 +208,19 @@ func handleBlock(buffer []byte, transferingFile *TransferingFile) {
 	position := binary.BigEndian.Uint32(buffer[:4])
 	transferingFile.ReceivedBlocks[position] = make([]byte, len(buffer))
 	copy(transferingFile.ReceivedBlocks[position], buffer)
-	log.Printf("DEBUG %d\tlen %d\tmd5: %s\n", position, len(transferingFile.ReceivedBlocks[position]), calculateMD5(transferingFile.ReceivedBlocks[position]))
 }
 
 func readMetadataByteArray(data []byte, transferingFile *TransferingFile) {
 	fileSize := binary.BigEndian.Uint32(data[4:8])
+	totalBlocks := binary.BigEndian.Uint32(data[24:28])
 
 	md5Hash := make([]byte, 16)
 	copy(md5Hash, data[8:24])
 
-	fileName := getFileName(data)
-
 	transferingFile.FileSize = fileSize
 	transferingFile.MD5Hash = md5Hash
-	transferingFile.FileName = fileName
-	transferingFile.TotalBlocks = int(math.Ceil(float64(fileSize) / float64(BUFFER_SIZE-2)))
-	transferingFile.ExpectedBlocks = transferingFile.TotalBlocks
-
-	fmt.Println("-------------------------------------")
-	fmt.Printf("File Name: %s\n", transferingFile.FileName)
-	fmt.Printf("File Size: %d\n", transferingFile.FileSize)
-	fmt.Printf("MD5 Hash: %x\n", transferingFile.MD5Hash)
-	fmt.Printf("Total Blocks: %x\n", transferingFile.TotalBlocks)
-	fmt.Println("-------------------------------------")
+	transferingFile.TotalBlocks = int(totalBlocks) - 1
+	transferingFile.ExpectedBlocks = int(totalBlocks) - 1
 }
 
 func showFiles() {
@@ -227,31 +229,44 @@ func showFiles() {
 	}
 
 	for _, file := range files {
-		fmt.Println("---------------------------")
-		fmt.Printf("Arquivo: %s\n", file.FileName)
-		fmt.Printf("\tTamanho do arquivo: %d\n", file.FileSize)
-		fmt.Printf("\tBlocos recebidos: %d\n", len(file.ReceivedBlocks))
-		fmt.Printf("\tBlocos totais: %d\n", file.TotalBlocks)
-		if file.TotalBlocks-len(file.ReceivedBlocks) != 0 {
-			fmt.Printf("\t\tBlocos faltantes: %s\n", getRemainingBlocks(&file))
-		}
-		fmt.Printf("\tConstruído: %t", file.Built)
-		fmt.Println("---------------------------")
+		printFileInfo(file)
 	}
 }
 
-func getRemainingBlocks(transferingFile *TransferingFile) string {
-	remaining := make([]uint32, 0)
-	last := uint32(0)
-	for block, _ := range transferingFile.ReceivedBlocks {
-		if block-last > 1 {
-			remaining = append(remaining, block)
+func printFileInfo(file *TransferingFile) {
+	fmt.Println("---------------------------------------------")
+	fmt.Printf("File: %s\n", file.FileName)
+	fmt.Printf("File size: %d\n", file.FileSize)
+	fmt.Printf("Received blocks: %d\n", len(file.ReceivedBlocks))
+	fmt.Printf("Total blocks: %d\n", file.TotalBlocks)
+	if file.TotalBlocks-len(file.ReceivedBlocks) != 0 {
+		fmt.Printf("\tMissing Blocks: %s\n", getMissingBlocks(file))
+	}
+	fmt.Printf("MD5: %x\n", file.MD5Hash)
+	fmt.Printf("Built: %t\n", file.Built)
+	fmt.Println("---------------------------------------------")
+}
+
+func getMissingBlocks(transferingFile *TransferingFile) string {
+	var missing []uint32
+	var blockNumbers []uint32
+
+	for block := range transferingFile.ReceivedBlocks {
+		blockNumbers = append(blockNumbers, block)
+	}
+
+	sort.Slice(blockNumbers, func(i, j int) bool { return blockNumbers[i] < blockNumbers[j] })
+
+	for i := 1; i < len(blockNumbers); i++ {
+		if blockNumbers[i]-blockNumbers[i-1] > 1 {
+			for missingBlock := blockNumbers[i-1] + 1; missingBlock < blockNumbers[i]; missingBlock++ {
+				missing = append(missing, missingBlock)
+			}
 		}
-		last = block
 	}
 
 	result := ""
-	for _, r := range remaining {
+	for _, r := range missing {
 		result += fmt.Sprintf("%d ", r)
 	}
 
@@ -259,7 +274,7 @@ func getRemainingBlocks(transferingFile *TransferingFile) string {
 }
 
 func getFileName(data []byte) string {
-	return string(data[24 : getEOF(data[24:])+24])
+	return string(data[28 : getEOF(data[28:])+28])
 }
 
 func getEOF(data []byte) int {
@@ -276,7 +291,6 @@ func calculateFileMD5(file *os.File) ([]byte, error) {
 	if _, err := io.Copy(hasher, file); err != nil {
 		return nil, err
 	}
-	log.Printf("DEBUG MD5: %x\n", hasher.Sum(nil))
 	return hasher.Sum(nil), nil
 }
 
@@ -295,8 +309,9 @@ func setupConnection() {
 
 	log.Printf("UDP Socket [%v] created\n", clientFd)
 
-	serverAddr = &unix.SockaddrInet4{
+	serverAddr = unix.SockaddrInet4{
 		Port: PORT,
+		Addr: [4]byte{127, 0, 0, 1},
 	}
 	copy(serverAddr.Addr[:], net.ParseIP(IP).To4())
 }
