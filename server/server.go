@@ -6,7 +6,6 @@ import (
 	"log"
 	"net"
 	"strings"
-	"time"
 )
 
 var PORT = 8080
@@ -64,18 +63,16 @@ func handleClient(clientAddr *unix.SockaddrInet4, n int, buffer []byte) {
 	}
 
 	for _, block := range blocks {
-		//log.Printf("DEBUG %d\tlen %d\tmd5: %s\t cont: %x\n", i, len(block), calculateMD5(block), block)
 		err = unix.Sendto(serverFd, block, 0, &unix.SockaddrInet4{Port: clientAddr.Port})
 		if err != nil {
 			log.Printf("Error writing to %s: %v\n", client, err)
 			return
 		}
-		time.Sleep(1000) // todo ve se prec
 	}
 }
 
 func handleCommand(command string) ([][]byte, error) {
-	parts := strings.Split(command, " ")
+	parts := strings.Split(strings.Trim(command, " "), " ")
 	if len(parts) == 0 {
 		return nil, COMMAND_ERROR
 	}

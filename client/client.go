@@ -58,7 +58,7 @@ func main() {
 	fmt.Println("Comandos:")
 	fmt.Println("GET <nome do arquivo>: para receber o arquivo. Ex: GET banana.gif")
 	fmt.Println("DISCARD <nome do arquivo> <número dos blocos>: para remover blocos recebidos do arquivo. Ex: DISCARD banana.gif 1 5 6")
-	fmt.Println("RECOVER <nome do arquivo> <número dos blocos>: para encontrar os blocos faltantes. Ex: RECOVER banana.gif 1 5 6")
+	fmt.Println("RECOVER <nome do arquivo>: para encontrar os blocos faltantes. Ex: RECOVER banana.gif")
 	fmt.Println("BUILD <nome do arquivo>: para juntar os bytes do arquivo. Ex: BUILD banana.gif")
 	fmt.Println("SHOW: para mostrar o estado dos arquivos recebidos")
 	fmt.Println("----------------------------")
@@ -84,11 +84,6 @@ func main() {
 }
 
 func sendMessage(message string) {
-	err := unix.Sendto(clientFd, []byte(message), 0, &serverAddr)
-	if err != nil {
-		log.Fatal("Error sending message to server:", err)
-	}
-
 	parts := strings.Split(message, " ")
 	transferingFile, exists := files[parts[1]]
 	if !exists && parts[0] == "RECOVER" {
@@ -96,21 +91,23 @@ func sendMessage(message string) {
 		return
 	}
 
+	if parts[0] == "RECOVER" {
+		message += " " + getMissingBlocks(transferingFile)
+	}
+
+	err := unix.Sendto(clientFd, []byte(message), 0, &serverAddr)
+	if err != nil {
+		log.Fatal("Error sending message to server:", err)
+	}
+
 	if !exists {
 		transferingFile = &TransferingFile{FileName: parts[1], ExpectedBlocks: 65535, ReceivedBlocks: make(map[uint32][]byte), Built: false}
 		files[parts[1]] = transferingFile
+	} else {
+		transferingFile.ExpectedBlocks = transferingFile.TotalBlocks
 	}
 
-	if parts[0] == "GET" {
-		handleReceivedBlocks(transferingFile)
-		return
-	}
-
-	if parts[0] == "RECOVER" { //todo entender pq o recover n ta funcionando
-		transferingFile.ExpectedBlocks = len(parts) - 2
-		handleReceivedBlocks(transferingFile)
-		return
-	}
+	handleReceivedBlocks(transferingFile)
 }
 
 func handleReceivedBlocks(transferingFile *TransferingFile) {
@@ -128,8 +125,7 @@ func handleReceivedBlocks(transferingFile *TransferingFile) {
 
 		handleBlock(buffer[:n], transferingFile)
 	}
-
-	log.Printf("File transfered successfully!")
+	log.Printf("Blocks transfered successfully!")
 }
 
 func verifyMD5(transferingFile *TransferingFile) bool {
@@ -177,7 +173,7 @@ func buildFile(parts []string) {
 	transferingFile.Built = true
 
 	if !verifyMD5(transferingFile) {
-		log.Printf("Received file may be corrupted")
+		log.Printf("Built file may be corrupted")
 		return
 	}
 

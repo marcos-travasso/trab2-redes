@@ -54,14 +54,16 @@ func handleRecover(parts []string) ([][]byte, error) {
 	}
 
 	dataBlocks := divideDataInBlocks(data)
-	toRecover := make([][]byte, len(parts)-2)
+	toRecover := make([][]byte, len(parts)-2, len(parts)-2)
+	i := 0
 
 	for _, blockN := range parts[2:] {
 		num, _ := strconv.Atoi(blockN)
 		num--
 
 		if num < len(dataBlocks) {
-			toRecover = append(toRecover, dataBlocks[num])
+			toRecover[i] = dataBlocks[num]
+			i++
 		}
 	}
 
