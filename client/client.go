@@ -1,30 +1,44 @@
 package main
 
 import (
+	"bufio"
 	"crypto/md5"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"golang.org/x/sys/unix"
 	"io"
 	"log"
-	"math"
 	"net"
 	"os"
+	"sort"
+	"strconv"
+	"strings"
 )
 
-const BUFFER_SIZE = 2048
-
-type Metadata struct {
-	FileSize    uint32
-	MD5Hash     []byte
-	FileName    string
-	TotalBlocks int
+type TransferingFile struct {
+	FileSize       uint32
+	MD5Hash        []byte
+	FileName       string
+	TotalBlocks    int
+	ExpectedBlocks int
+	ReceivedBlocks map[uint32][]byte
+	Built          bool
 }
 
+const BUFFER_SIZE = 2048
+const IP = "127.0.0.1"
+const PORT = 8080
+
+var files map[string]*TransferingFile
+var clientFd int
+var serverAddr unix.SockaddrInet4
+
 func main() {
-	// Create UDP socket
-	clientFd, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM, 0)
+	//setupConnection()
+	var err error
+	clientFd, err = unix.Socket(unix.AF_INET, unix.SOCK_DGRAM, 0)
 	if err != nil {
 		log.Fatal("Error creating UDP socket:", err)
 	}
@@ -32,56 +46,101 @@ func main() {
 
 	log.Printf("UDP Socket [%v] created\n", clientFd)
 
-	// Server address and port
-	serverAddr := &unix.SockaddrInet4{
-		Port: 8080,
+	serverAddr = unix.SockaddrInet4{
+		Port: PORT,
+		Addr: [4]byte{127, 0, 0, 1},
 	}
-	copy(serverAddr.Addr[:], net.ParseIP("127.0.0.1").To4())
+	copy(serverAddr.Addr[:], net.ParseIP(IP).To4())
 
-	// Message to send
-	//message := []byte("GET hello2.txt")
-	message := []byte("GET banana.gif")
+	files = make(map[string]*TransferingFile)
 
-	// Send the message to the server
-	err = unix.Sendto(clientFd, message, 0, serverAddr)
+	message := ""
+	fmt.Println("-------- UDP SERVER --------")
+	fmt.Println("Comandos:")
+	fmt.Println("GET <nome do arquivo>: para receber o arquivo. Ex: GET banana.gif")
+	fmt.Println("DISCARD <nome do arquivo> <número dos blocos>: para remover blocos recebidos do arquivo. Ex: DISCARD banana.gif 1 5 6")
+	fmt.Println("RECOVER <nome do arquivo>: para encontrar os blocos faltantes. Ex: RECOVER banana.gif")
+	fmt.Println("BUILD <nome do arquivo>: para juntar os bytes do arquivo. Ex: BUILD banana.gif")
+	fmt.Println("SHOW: para mostrar o estado dos arquivos recebidos")
+	fmt.Println("----------------------------")
+
+	reader := bufio.NewReader(os.Stdin)
+	for string(message) != "QUIT" {
+		fmt.Printf("> ")
+		message, _ = reader.ReadString('\n')
+		message = strings.ReplaceAll(message, "\n", "")
+
+		parts := strings.Split(message, " ")
+		parts[0] = strings.ToUpper(parts[0])
+		switch parts[0] {
+		case "GET", "RECOVER":
+			sendMessage(message)
+		case "BUILD":
+			buildFile(parts)
+		case "SHOW":
+			showFiles()
+		case "DISCARD":
+			discardBlocks(parts)
+		}
+	}
+}
+
+func sendMessage(message string) {
+	parts := strings.Split(message, " ")
+	transferingFile, exists := files[parts[1]]
+	if !exists && parts[0] == "RECOVER" {
+		log.Println("Error: no file to recover")
+		return
+	}
+
+	if parts[0] == "RECOVER" {
+		message += " " + getMissingBlocks(transferingFile)
+	}
+
+	err := unix.Sendto(clientFd, []byte(message), 0, &serverAddr)
 	if err != nil {
 		log.Fatal("Error sending message to server:", err)
 	}
 
-	log.Printf("Message sent to the server: %s\n", string(message))
+	if !exists {
+		transferingFile = &TransferingFile{FileName: parts[1], ExpectedBlocks: 65535, ReceivedBlocks: make(map[uint32][]byte), Built: false}
+		files[parts[1]] = transferingFile
+	} else {
+		transferingFile.ExpectedBlocks = transferingFile.TotalBlocks
+	}
 
-	receivedBlocks := make(map[uint32][]byte)
-	metadata := Metadata{TotalBlocks: 65535}
-	for len(receivedBlocks) != metadata.TotalBlocks {
+	err = handleReceivedBlocks(transferingFile)
+	if err != nil {
+		delete(files, parts[1])
+	}
+}
+
+func handleReceivedBlocks(transferingFile *TransferingFile) error {
+	for len(transferingFile.ReceivedBlocks) != transferingFile.ExpectedBlocks {
 		buffer := make([]byte, BUFFER_SIZE)
 		n, _, err := unix.Recvfrom(clientFd, buffer, 0)
 		if err != nil {
 			log.Fatal("Error receiving response from server:", err)
 		}
 
-		if n < 4 {
-			continue
-		}
-
 		if binary.BigEndian.Uint32(buffer[:4]) == 0 {
-			metadata = handleMetadata(buffer)
+			readMetadataByteArray(buffer, transferingFile)
 			continue
 		}
+		if binary.BigEndian.Uint32(buffer[:4]) == 0xFFFF {
+			log.Println("Error: file not found")
+			return errors.New("file not found")
+		}
 
-		handleBlock(buffer[:n], receivedBlocks)
+		handleBlock(buffer[:n], transferingFile)
 	}
 
-	buildFile(metadata, receivedBlocks)
-
-	if !verifyMD5(metadata) {
-		log.Fatal("Received file may be corrupted")
-	}
-
-	log.Printf("File transfered successfully!")
+	log.Printf("Blocks transfered successfully!")
+	return nil
 }
 
-func verifyMD5(metadata Metadata) bool {
-	f, err := os.Open(metadata.FileName)
+func verifyMD5(transferingFile *TransferingFile) bool {
+	f, err := os.Open(transferingFile.FileName)
 	if err != nil {
 		return false
 	}
@@ -92,21 +151,27 @@ func verifyMD5(metadata Metadata) bool {
 		return false
 	}
 
-	return hex.EncodeToString(fileMD5) == hex.EncodeToString(metadata.MD5Hash)
+	return hex.EncodeToString(fileMD5) == hex.EncodeToString(transferingFile.MD5Hash)
 }
 
-func buildFile(metadata Metadata, blocks map[uint32][]byte) {
-	f, err := os.Create("./" + metadata.FileName)
+func buildFile(parts []string) {
+	transferingFile, exists := files[parts[1]]
+	if !exists {
+		log.Println("File not found to build")
+		return
+	}
+
+	f, err := os.Create("./" + transferingFile.FileName)
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer f.Close()
 
-	for i := 1; i <= len(blocks); i++ {
-
-		block, exists := blocks[uint32(i)]
+	for i := 1; i <= len(transferingFile.ReceivedBlocks); i++ {
+		block, exists := transferingFile.ReceivedBlocks[uint32(i)]
 		if !exists {
 			log.Printf("Error: block %d not found\n", i)
+			continue
 		}
 
 		_, err := f.Write(block[4:])
@@ -115,47 +180,108 @@ func buildFile(metadata Metadata, blocks map[uint32][]byte) {
 			log.Fatalln("Error writing file:", err)
 		}
 	}
-}
 
-func handleBlock(buffer []byte, received map[uint32][]byte) {
-	position := binary.BigEndian.Uint32(buffer[:4])
-	received[position] = make([]byte, len(buffer))
-	copy(received[position], buffer)
-	//log.Printf("DEBUG %d\tlen %d\tmd5: %s\n", position, len(received[position]), calculateMD5(received[position]))
-}
+	transferingFile.Built = true
 
-func handleMetadata(buffer []byte) Metadata {
-	metadata, err := readMetadataByteArray(buffer)
-	if err != nil {
-		log.Fatal("Error reading metadata:", err)
+	if !verifyMD5(transferingFile) {
+		log.Printf("Built file may be corrupted")
+		return
 	}
 
-	fmt.Println("-------------------------------------")
-	fmt.Printf("File Size: %d\n", metadata.FileSize)
-	fmt.Printf("MD5 Hash: %x\n", metadata.MD5Hash)
-	fmt.Printf("File Name: %s\n", metadata.FileName)
-	fmt.Println("-------------------------------------")
-	return metadata
+	log.Println("File built successfully!")
 }
 
-func readMetadataByteArray(data []byte) (Metadata, error) {
+func discardBlocks(parts []string) {
+	transferingFile, exists := files[parts[1]]
+	if !exists {
+		log.Println("File not found to discard")
+		return
+	}
+
+	discarded := 0
+	for _, blockN := range parts[2:] {
+		num, _ := strconv.Atoi(blockN)
+		_, exists = transferingFile.ReceivedBlocks[uint32(num)]
+		if exists {
+			delete(transferingFile.ReceivedBlocks, uint32(num))
+			discarded++
+		}
+	}
+
+	log.Printf("Discarded %x blocks\n", discarded)
+}
+
+func handleBlock(buffer []byte, transferingFile *TransferingFile) {
+	position := binary.BigEndian.Uint32(buffer[:4])
+	transferingFile.ReceivedBlocks[position] = make([]byte, len(buffer))
+	copy(transferingFile.ReceivedBlocks[position], buffer)
+}
+
+func readMetadataByteArray(data []byte, transferingFile *TransferingFile) {
 	fileSize := binary.BigEndian.Uint32(data[4:8])
+	totalBlocks := binary.BigEndian.Uint32(data[24:28])
 
 	md5Hash := make([]byte, 16)
 	copy(md5Hash, data[8:24])
 
-	fileName := getFileName(data)
+	transferingFile.FileSize = fileSize
+	transferingFile.MD5Hash = md5Hash
+	transferingFile.TotalBlocks = int(totalBlocks) - 1
+	transferingFile.ExpectedBlocks = int(totalBlocks) - 1
+}
 
-	return Metadata{
-		FileSize:    fileSize,
-		MD5Hash:     md5Hash,
-		FileName:    fileName,
-		TotalBlocks: int(math.Ceil(float64(fileSize) / float64(BUFFER_SIZE-2))),
-	}, nil
+func showFiles() {
+	if len(files) == 0 {
+		log.Println("No files to show")
+	}
+
+	for _, file := range files {
+		printFileInfo(file)
+	}
+}
+
+func printFileInfo(file *TransferingFile) {
+	fmt.Println("---------------------------------------------")
+	fmt.Printf("File: %s\n", file.FileName)
+	fmt.Printf("File size: %d\n", file.FileSize)
+	fmt.Printf("Received blocks: %d\n", len(file.ReceivedBlocks))
+	fmt.Printf("Total blocks: %d\n", file.TotalBlocks)
+	if file.TotalBlocks-len(file.ReceivedBlocks) != 0 {
+		fmt.Printf("\tMissing Blocks: %s\n", getMissingBlocks(file))
+	}
+	fmt.Printf("MD5: %x\n", file.MD5Hash)
+	fmt.Printf("Built: %t\n", file.Built)
+	fmt.Println("---------------------------------------------")
+}
+
+func getMissingBlocks(transferingFile *TransferingFile) string {
+	var missing []uint32
+	var blockNumbers []uint32
+
+	for block := range transferingFile.ReceivedBlocks {
+		blockNumbers = append(blockNumbers, block)
+	}
+
+	sort.Slice(blockNumbers, func(i, j int) bool { return blockNumbers[i] < blockNumbers[j] })
+
+	for i := 1; i < len(blockNumbers); i++ {
+		if blockNumbers[i]-blockNumbers[i-1] > 1 {
+			for missingBlock := blockNumbers[i-1] + 1; missingBlock < blockNumbers[i]; missingBlock++ {
+				missing = append(missing, missingBlock)
+			}
+		}
+	}
+
+	result := ""
+	for _, r := range missing {
+		result += fmt.Sprintf("%d ", r)
+	}
+
+	return result
 }
 
 func getFileName(data []byte) string {
-	return string(data[24 : getEOF(data[24:])+24])
+	return string(data[28 : getEOF(data[28:])+28])
 }
 
 func getEOF(data []byte) int {
@@ -172,6 +298,27 @@ func calculateFileMD5(file *os.File) ([]byte, error) {
 	if _, err := io.Copy(hasher, file); err != nil {
 		return nil, err
 	}
-	log.Printf("DEBUG MD5: %x\n", hasher.Sum(nil))
 	return hasher.Sum(nil), nil
+}
+
+func calculateMD5(data []byte) string {
+	hash := md5.Sum(data)
+	return hex.EncodeToString(hash[:])
+}
+
+func setupConnection() {
+	var err error
+	clientFd, err = unix.Socket(unix.AF_INET, unix.SOCK_DGRAM, 0)
+	if err != nil {
+		log.Fatal("Error creating UDP socket:", err)
+	}
+	defer unix.Close(clientFd)
+
+	log.Printf("UDP Socket [%v] created\n", clientFd)
+
+	serverAddr = unix.SockaddrInet4{
+		Port: PORT,
+		Addr: [4]byte{127, 0, 0, 1},
+	}
+	copy(serverAddr.Addr[:], net.ParseIP(IP).To4())
 }
