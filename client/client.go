@@ -5,6 +5,7 @@ import (
 	"crypto/md5"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"golang.org/x/sys/unix"
 	"io"
@@ -70,6 +71,7 @@ func main() {
 		message = strings.ReplaceAll(message, "\n", "")
 
 		parts := strings.Split(message, " ")
+		parts[0] = strings.ToUpper(parts[0])
 		switch parts[0] {
 		case "GET", "RECOVER":
 			sendMessage(message)
@@ -107,10 +109,13 @@ func sendMessage(message string) {
 		transferingFile.ExpectedBlocks = transferingFile.TotalBlocks
 	}
 
-	handleReceivedBlocks(transferingFile)
+	err = handleReceivedBlocks(transferingFile)
+	if err != nil {
+		delete(files, parts[1])
+	}
 }
 
-func handleReceivedBlocks(transferingFile *TransferingFile) {
+func handleReceivedBlocks(transferingFile *TransferingFile) error {
 	for len(transferingFile.ReceivedBlocks) != transferingFile.ExpectedBlocks {
 		buffer := make([]byte, BUFFER_SIZE)
 		n, _, err := unix.Recvfrom(clientFd, buffer, 0)
@@ -122,10 +127,16 @@ func handleReceivedBlocks(transferingFile *TransferingFile) {
 			readMetadataByteArray(buffer, transferingFile)
 			continue
 		}
+		if binary.BigEndian.Uint32(buffer[:4]) == 0xFFFF {
+			log.Println("Error: file not found")
+			return errors.New("file not found")
+		}
 
 		handleBlock(buffer[:n], transferingFile)
 	}
+
 	log.Printf("Blocks transfered successfully!")
+	return nil
 }
 
 func verifyMD5(transferingFile *TransferingFile) bool {

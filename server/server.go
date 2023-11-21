@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/binary"
 	"errors"
 	"golang.org/x/sys/unix"
 	"log"
@@ -12,8 +13,8 @@ var PORT = 8080
 var serverFd int
 var BUFFER_SIZE = 2048
 
-var COMMAND_ERROR = errors.New("Command error")
-var FILE_ERROR = errors.New("File error")
+var COMMAND_ERROR = errors.New("command error")
+var FILE_ERROR = errors.New("file error")
 
 func main() {
 	var err error
@@ -57,6 +58,13 @@ func handleClient(clientAddr *unix.SockaddrInet4, n int, buffer []byte) {
 	log.Printf("%s > %s\n", client, string(buffer[:n]))
 
 	blocks, err := handleCommand(string(buffer[:n]))
+	if errors.Is(err, FILE_ERROR) {
+		block := make([]byte, 4)
+		binary.BigEndian.PutUint32(block[0:4], 0xFFFF)
+
+		unix.Sendto(serverFd, block, 0, &unix.SockaddrInet4{Port: clientAddr.Port})
+		return
+	}
 	if err != nil {
 		log.Printf("Error handling client %s: %v\n", client, err)
 		return
