@@ -10,8 +10,8 @@ import (
 )
 
 var PORT = 8080
-var serverFd int
 var BUFFER_SIZE = 2048
+var serverFd int
 
 var COMMAND_ERROR = errors.New("command error")
 var FILE_ERROR = errors.New("file error")

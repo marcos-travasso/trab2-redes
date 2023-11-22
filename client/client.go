@@ -36,21 +36,8 @@ var clientFd int
 var serverAddr unix.SockaddrInet4
 
 func main() {
-	//setupConnection()
-	var err error
-	clientFd, err = unix.Socket(unix.AF_INET, unix.SOCK_DGRAM, 0)
-	if err != nil {
-		log.Fatal("Error creating UDP socket:", err)
-	}
+	setupConnection()
 	defer unix.Close(clientFd)
-
-	log.Printf("UDP Socket [%v] created\n", clientFd)
-
-	serverAddr = unix.SockaddrInet4{
-		Port: PORT,
-		Addr: [4]byte{127, 0, 0, 1},
-	}
-	copy(serverAddr.Addr[:], net.ParseIP(IP).To4())
 
 	files = make(map[string]*TransferingFile)
 
@@ -280,19 +267,6 @@ func getMissingBlocks(transferingFile *TransferingFile) string {
 	return result
 }
 
-func getFileName(data []byte) string {
-	return string(data[28 : getEOF(data[28:])+28])
-}
-
-func getEOF(data []byte) int {
-	for i, b := range data {
-		if b == 0 {
-			return i
-		}
-	}
-	return len(data)
-}
-
 func calculateFileMD5(file *os.File) ([]byte, error) {
 	hasher := md5.New()
 	if _, err := io.Copy(hasher, file); err != nil {
@@ -301,24 +275,16 @@ func calculateFileMD5(file *os.File) ([]byte, error) {
 	return hasher.Sum(nil), nil
 }
 
-func calculateMD5(data []byte) string {
-	hash := md5.Sum(data)
-	return hex.EncodeToString(hash[:])
-}
-
 func setupConnection() {
 	var err error
 	clientFd, err = unix.Socket(unix.AF_INET, unix.SOCK_DGRAM, 0)
 	if err != nil {
 		log.Fatal("Error creating UDP socket:", err)
 	}
-	defer unix.Close(clientFd)
-
 	log.Printf("UDP Socket [%v] created\n", clientFd)
 
 	serverAddr = unix.SockaddrInet4{
 		Port: PORT,
-		Addr: [4]byte{127, 0, 0, 1},
 	}
 	copy(serverAddr.Addr[:], net.ParseIP(IP).To4())
 }
